@@ -10,6 +10,7 @@ Backend = Literal["auto", "cpu", "gpu"]
 def clean(
     df: pd.DataFrame,
     timestamp_col: str = "Date",
+    symbol_col: str = "Symbol",
     drop_duplicate_rows: bool = True,
     drop_duplicate_cols: bool = True,
     drop_constant_columns: bool = True,
@@ -36,6 +37,10 @@ def clean(
 
     if using_gpu and started_as_pandas:
         df = cudf.from_pandas(df)  # type: ignore
+
+
+    if verbose:
+        print(f"[CLEAN] Backend: {'GPU' if using_gpu else 'CPU'}")
 
     start_total = time()
     df = df.copy()
@@ -67,7 +72,6 @@ def clean(
                   f"Total Removed: {before[0] - after[0]} in {time() - start_time:.5f}s")
 
 
-
     if drop_duplicate_cols:
         if verbose:
             print("[CLEAN] Dropping duplicate columns...")
@@ -75,22 +79,24 @@ def clean(
         before = df.shape
 
         if using_gpu:
-            col_hash = {c: cudf.hash(df[c]).sum().item() for c in df.columns}  # type: ignore
+            # GPU-safe: hash on host (pandas) to avoid cuDF API differences
+            col_hash = {c: hash_pandas_object(df[c].to_pandas(), index=False).sum()
+                        for c in df.columns}
         else:
             col_hash = {c: hash_pandas_object(df[c], index=False).sum() for c in df.columns}
+
         seen, keep = set(), []
         for c, h in col_hash.items():
             if h not in seen:
                 seen.add(h)
                 keep.append(c)
         df = df[keep]
-        
+
         after = df.shape
         if verbose:
             print(f"[CLEAN] Original Column Count: {before[1]}, "
-                  f"Column Count After Removing Duplicates: {after[1]}, "
-                  f"Total Removed: {before[1] - after[1]} in {time() - start_time:.5f}s")
-
+                f"Column Count After Removing Duplicates: {after[1]}, "
+                f"Total Removed: {before[1] - after[1]} in {time() - start_time:.5f}s")
 
 
     if drop_constant_columns:
@@ -98,11 +104,12 @@ def clean(
             print("[CLEAN] Dropping constant columns...")
         start_time = time()
         before = df.shape
-        
-        num_cols = df.select_dtypes(include=['number'])
+
+        num_cols = df.select_dtypes(include=[np.number])
         if num_cols.shape[1] > 0:
             nunique = num_cols.nunique(dropna=True)
-            constant_cols = nunique[nunique <= 1].index.tolist()
+            nunique_pd = nunique.to_pandas() if using_gpu else nunique
+            constant_cols = nunique_pd[nunique_pd <= 1].index.tolist()
             if constant_cols:
                 df = df.drop(columns=constant_cols)
         else:
@@ -115,37 +122,60 @@ def clean(
 
 
     if drop_constant_rows:
-        if verbose: print('[CLEAN] Dropping constant rows...')
+        if verbose:
+            print('[CLEAN] Dropping constant rows...')
         start_time = time()
         before = df.shape
 
-        num = df.select_dtypes(include=['number'])
-        if num.shape[1] > 0:
-            try:
+        if using_gpu:
+            # Do the computation in pandas, then convert back to cuDF
+            df_pd = df.to_pandas()
+            num_pd = df_pd.select_dtypes(include=[np.number])
+            if num_pd.shape[1] > 0:
+                row_min = num_pd.min(axis=1, skipna=True)
+                row_max = num_pd.max(axis=1, skipna=True)
+                non_empty = num_pd.count(axis=1) > 0
+                const_mask = (row_min == row_max) & non_empty
+                df_pd = df_pd.loc[~const_mask]
+            df = cudf.from_pandas(df_pd)  # back to GPU frame
+        else:
+            # Native pandas path
+            num = df.select_dtypes(include=[np.number])
+            if num.shape[1] > 0:
                 row_min = num.min(axis=1, skipna=True)
                 row_max = num.max(axis=1, skipna=True)
                 non_empty = num.count(axis=1) > 0
                 const_mask = (row_min == row_max) & non_empty
                 df = df.loc[~const_mask]
-            except Exception:
-                if verbose:
-                    print("[CLEAN] Skipping constant-row drop on this backend (row-wise reductions unsupported).")
 
         after = df.shape
         if verbose:
             print(f"[CLEAN] Dropped {before[0] - after[0]} constant rows (Rows: {before[0]} → {after[0]}) in {time() - start_time:.3f}s")
 
-
-
-    if replace_placeholders: 
+    if replace_placeholders:
         if verbose:
             print("[CLEAN] Checking for common placeholder values...")
         start_time = time()
-        df = df.replace(to_replace=placeholders, value=np.nan)
-        if verbose:
-            nulls = df.isnull().sum().sum()
-            print(f"[CLEAN] Total nulls after placeholder replacement: {nulls} in {time() - start_time:.5f}s")
 
+        protect = {symbol_col, timestamp_col}
+        if using_gpu:
+            str_cols = [c for c in df.columns if str(df[c].dtype) in ("object","str","string")]
+            for c in str_cols:
+                if c in protect:
+                    continue
+                df[c] = df[c].mask(df[c].isin(placeholders), None)
+        else:
+            str_cols = df.select_dtypes(include=["object","string"]).columns
+            for c in str_cols:
+                if c in protect:
+                    continue
+                df[c] = df[c].replace(to_replace=placeholders, value=np.nan)
+
+        nulls = df.isnull().sum().sum()
+        try: nulls = int(nulls)
+        except: pass
+        if verbose:
+            print(f"[CLEAN] Total nulls after placeholder replacement: {nulls} in {time() - start_time:.5f}s")
 
 
     if sort_index:
@@ -184,25 +214,29 @@ def clean(
         df = df.drop(columns=[timestamp_col])
 
 
-
     if convert_numeric:
         if verbose:
             print("[CLEAN] Converting to numeric types...")
         start_time = time()
-        obj_cols = df.select_dtypes(include=['object', 'string']).columns
 
-        if len(obj_cols) > 0:
+        protect = {symbol_col, timestamp_col}
+        obj_cols = [c for c in df.select_dtypes(include=['object','string']).columns if c not in protect]
+
+        if obj_cols:
             if using_gpu:
                 try:
-                    import cudf  # type: ignore
+                    import cudf
                     for c in obj_cols:
                         try:
-                            df[c] = cudf.to_numeric(df[c], errors='coerce') 
+                            df[c] = cudf.to_numeric(df[c], errors='coerce')
                         except Exception:
-                            df[c] = df[c].astype('float64') 
+                            try:
+                                df[c] = df[c].astype('float64')
+                            except Exception:
+                                pass
                 except Exception:
                     if verbose:
-                        print("[CLEAN] Skipping numeric conversion on GPU (unsupported cuDF version).")
+                        print("[CLEAN] Skipping GPU numeric conversion (cuDF not available).")
             else:
                 for c in obj_cols:
                     df[c] = pd.to_numeric(df[c], errors='coerce')

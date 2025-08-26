@@ -13,6 +13,7 @@ def main():
     df = clean(
         df,
         timestamp_col="Date",
+        symbol_col="Symbol",
         drop_duplicate_rows=True,
         drop_duplicate_cols=True,
         drop_constant_columns=True,
@@ -26,6 +27,12 @@ def main():
         backend=backend,   
     )
     
+    assert df["Symbol"].notna().all(), "Symbol got coerced to NaN somewhere"
+    assert df["Symbol"].dtype == "object" or str(df["Symbol"].dtype) == "category"
+    assert "Date" in df.columns
+    df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
+    assert df["Date"].is_monotonic_increasing, "Index not sorted by Date"
+
     df = engineer(
         df,
         time_block_feature="1H",
@@ -33,10 +40,10 @@ def main():
         normalization=None,
         lagged_features=10,  
         pairwise_features=False,
-        verbose=False,
+        verbose=True,
     )
     
-    print(df.head())  
+    print(df.head(25))  
 
 
 if __name__ == "__main__":
