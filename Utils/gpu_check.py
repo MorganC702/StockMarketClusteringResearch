@@ -1,3 +1,4 @@
+
 def _gpu_available() -> bool:
     try:
         import rmm  # RAPIDS memory manager

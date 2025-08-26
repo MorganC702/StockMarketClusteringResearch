@@ -22,7 +22,7 @@ def main():
         placeholders=("Null","null","NULL","NaN","nan","NAN","None","none","NONE"),  
         interpolate_missing=False,
         convert_numeric=True,
-        sort_index=True,
+        sort_by="timestamp",
         verbose=True,
         backend=backend,   
     )

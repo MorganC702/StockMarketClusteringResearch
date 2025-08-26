@@ -2,10 +2,9 @@ import pandas as pd
 from pandas.util import hash_pandas_object
 from time import time
 from Utils.gpu_check import _gpu_available
+from typing import Literal, Optional
 import numpy as np 
-from typing import Literal
 
-Backend = Literal["auto", "cpu", "gpu"]
 
 def clean(
     df: pd.DataFrame,
@@ -19,14 +18,18 @@ def clean(
     placeholders = ("Null","null","NULL","NaN","nan","NAN","None","none","NONE"),  
     interpolate_missing: bool = False,
     convert_numeric: bool = True,
-    sort_index: bool = True,
+    sort_by: Optional[Literal["index", "timestamp"]]= "timestamp",
     verbose: bool = False,
-    backend: Backend = "auto",
+    backend: Literal["auto", "cpu", "gpu"] = "auto",
 ):
-
+    # Track the time taken to clean the data. 
+    start_total = time()
+    df = df.copy()
+    
     started_as_pandas = isinstance(df, pd.DataFrame)
     using_gpu = False
     cudf = None
+
 
     if backend in ("gpu", "auto"):
         if _gpu_available():
@@ -35,55 +38,45 @@ def clean(
         else:
             using_gpu = False
 
+
     if using_gpu and started_as_pandas:
         df = cudf.from_pandas(df)  # type: ignore
 
 
     if verbose:
-        print(f"[CLEAN] Backend: {'GPU' if using_gpu else 'CPU'}")
-
-    start_total = time()
-    df = df.copy()
-    
+        print("\n######################################################")
+        print(f"Backend Is Utilizing {'GPU' if using_gpu else 'CPU'}")
+        print("######################################################\n")
+        
     
     if verbose:
         shape = (int(df.shape[0]), int(df.shape[1]))
-        print(f"[CLEAN] Starting. shape={shape}")
+        print(f"[---CLEAN---] Starting Shape={shape}")
 
 
-    timestamp = None
-    if timestamp_col in df.columns:
-        timestamp = df[timestamp_col].copy()
-        if verbose:
-            print(f"[CLEAN] Preserving timestamp column: '{timestamp_col}'")
+    # Columns to protect from modification
+    protect = {
+        symbol_col, 
+        timestamp_col
+    }
+    if verbose:
+        print(f"[---CLEAN---] Preserving: {symbol_col} and {timestamp_col}\n")
 
 
-
-    if drop_duplicate_rows:
-        if verbose:
-            print("[CLEAN] Dropping duplicate rows...")
-        start_time = time()
-        before = df.shape
-        df = df.drop_duplicates()
-        after = df.shape
-        if verbose:
-            print(f"[CLEAN] Original Row Count: {before[0]}, "
-                  f"Row Count After Removing Duplicates: {after[0]}, "
-                  f"Total Removed: {before[0] - after[0]} in {time() - start_time:.5f}s")
-
-
+    # Remove Duplicate Columns
     if drop_duplicate_cols:
         if verbose:
-            print("[CLEAN] Dropping duplicate columns...")
-        start_time = time()
-        before = df.shape
-
+            print("[---CLEAN---] Step 1: Remove Dupicate Columns.")
+        t0 = time()
+        s1 = df.shape
+        
         if using_gpu:
             # GPU-safe: hash on host (pandas) to avoid cuDF API differences
             col_hash = {c: hash_pandas_object(df[c].to_pandas(), index=False).sum()
                         for c in df.columns}
         else:
-            col_hash = {c: hash_pandas_object(df[c], index=False).sum() for c in df.columns}
+            col_hash = {c: hash_pandas_object(df[c], index=False).sum() 
+                        for c in df.columns}
 
         seen, keep = set(), []
         for c, h in col_hash.items():
@@ -91,20 +84,39 @@ def clean(
                 seen.add(h)
                 keep.append(c)
         df = df[keep]
-
-        after = df.shape
+        
+        s2 = df.shape
         if verbose:
-            print(f"[CLEAN] Original Column Count: {before[1]}, "
-                f"Column Count After Removing Duplicates: {after[1]}, "
-                f"Total Removed: {before[1] - after[1]} in {time() - start_time:.5f}s")
+            print(f"[---CLEAN---] Original Column Count: {s1[1]}, "
+                f"Column Count After Removing Duplicates: {s2[1]}, "
+                f"Total Removed: {s1[1] - s2[1]} in {time() - t0:.5f}s\n")
 
 
+
+    # Remove Duplicate Rows
+    if drop_duplicate_rows:
+        if verbose:
+            print("[---CLEAN---] Step 2: Remove Dupicate Rows.")
+        t0 = time()
+        s1 = df.shape
+        df = df.drop_duplicates()
+        s2 = df.shape
+        if verbose:
+            print(f"[---CLEAN---] Original Row Count: {s1[0]}, "
+                  f"Row Count After Removing Duplicates: {s2[0]}, "
+                  f"Total Removed: {s1[0] - s2[0]} in {time() - t0:.5f}s\n")
+             
+
+
+    # Drop Columns that contain the same value for each row.
     if drop_constant_columns:
         if verbose:
-            print("[CLEAN] Dropping constant columns...")
-        start_time = time()
-        before = df.shape
-
+            print("[---CLEAN---] Step 3: Remove Constant Columns.")
+        
+        t0 = time()
+        s1 = df.shape
+        
+        # Do not drop constant object or category colums (Symbol is expected to be constant)
         num_cols = df.select_dtypes(include=[np.number])
         if num_cols.shape[1] > 0:
             nunique = num_cols.nunique(dropna=True)
@@ -115,17 +127,21 @@ def clean(
         else:
             constant_cols = []
 
-        after = df.shape
+        s2 = df.shape
+        
         if verbose:
-            print(f"[CLEAN] Dropped {len(constant_cols)} constant columns (Columns: {before[1]} → {after[1]}) in {time() - start_time:.3f}s")
-
-
-
+            print(f"[---CLEAN---] Original Column Count: {s1[1]}, "
+                f"Column Count After Removing Constants: {s2[1]}, "
+                f"Total Removed: {s1[1] - s2[1]} in {time() - t0:.5f}s\n")
+            
+            
+            
+    # Drop Rows that contain the same value for each column.
     if drop_constant_rows:
         if verbose:
-            print('[CLEAN] Dropping constant rows...')
-        start_time = time()
-        before = df.shape
+            print('[---CLEAN---] Step 4: Remove Constant Rows.')
+        t0 = time()
+        s1 = df.shape
 
         if using_gpu:
             # Do the computation in pandas, then convert back to cuDF
@@ -148,18 +164,24 @@ def clean(
                 const_mask = (row_min == row_max) & non_empty
                 df = df.loc[~const_mask]
 
-        after = df.shape
+        s2 = df.shape
+        
         if verbose:
-            print(f"[CLEAN] Dropped {before[0] - after[0]} constant rows (Rows: {before[0]} → {after[0]}) in {time() - start_time:.3f}s")
-
+            print(f"[---CLEAN---] Original Row Count: {s1[0]}, "
+                f"Column Count After Removing Constants: {s2[0]}, "
+                f"Total Removed: {s1[0] - s2[0]} in {time() - t0:.5f}s\n")
+            
+                 
+                 
+    # Replace any placeholder values with NaNs  
     if replace_placeholders:
         if verbose:
-            print("[CLEAN] Checking for common placeholder values...")
-        start_time = time()
+            print("[---CLEAN---] Step 5: Replacing Placeholder Values")
+        
+        t0 = time()
 
-        protect = {symbol_col, timestamp_col}
         if using_gpu:
-            str_cols = [c for c in df.columns if str(df[c].dtype) in ("object","str","string")]
+            str_cols = [c for c in df.columns if str(df[c].dtype) in ( "object", "str", "string" )]
             for c in str_cols:
                 if c in protect:
                     continue
@@ -175,53 +197,73 @@ def clean(
         try: nulls = int(nulls)
         except: pass
         if verbose:
-            print(f"[CLEAN] Total nulls after placeholder replacement: {nulls} in {time() - start_time:.5f}s")
+            print(f"[---CLEAN---] Total Nulls After Placeholder Replacement: {nulls} in {time() - t0:.5f}s\n")
 
 
-    if sort_index:
+    # Sort the values in the dataframe by either index or time/date. 
+    if sort_by:
         if verbose:
-            print("[CLEAN] Sorting index...")
-        start_time = time()
-        df = df.sort_index()
+            print(f"[---CLEAN---] Step 6: Sorting by {sort_by.capitalize()}.")
+        t0 = time()
+        
+        if sort_by == "index":
+            df = df.sort_index()
+        elif sort_by == "timestamp":
+            
+            if timestamp_col not in df.columns:
+                raise ValueError(f"Column '{timestamp_col}' not found for timestamp sorting.")
+            
+            if timestamp_col in df.columns:
+                if using_gpu:
+                    df[timestamp_col] = df[timestamp_col].astype("datetime64[ns]")
+                else:
+                    df[timestamp_col] = pd.to_datetime(df[timestamp_col], errors="coerce")
+
+            df = df.sort_values(by=timestamp_col)
+        else:
+            raise ValueError(f"Invalid value for sort_by: {sort_by}. Must be 'index' or 'timestamp'.")
+        
         if verbose:
-            print(f"[CLEAN] Index sorted in {time() - start_time:.3f}s") 
+            print(f"[---CLEAN---] Sorted by {sort_by} in {time() - t0:.3f}s\n")
         
 
-    
+    # Forward Fill and Backward fill to inpute Missing Values / NaNs 
     if interpolate_missing:
         if verbose:
-            print("[CLEAN] Interpolating missing values...")
-        start_time = time()
-        na_before = df.isna().sum().sum()
+            print("[---CLEAN---] Step 7: Interpolating missing and NaN values.")
+        
+        t0 = time()
+        
+        n1 = df.isna().sum().sum()
         try:
-            na_before = int( na_before)
+            n1 = int(n1)
         except Exception:
             pass
+        
         numeric_cols = df.select_dtypes(include=['number']).columns
         if len(numeric_cols) > 0:
             df[numeric_cols] = df[numeric_cols].ffill().bfill()
-        na_after = df.isna().sum().sum()
+        n2 = df.isna().sum().sum()
+        
         try:
-            na_after = int( na_after)
+            n2 = int( n2)
         except Exception:
             pass
+        
         if verbose:
-            print(f"[CLEAN] Missing values: {int(na_before)} → {int(na_after)} (Δ={int(na_before - na_after)}) in {time() - start_time:.3f}s")
+            print(f"[---CLEAN---] Initial Invalid values Count: {int(n1)}, "
+                f"Invalid Values Count After Interpolating: {int(n2)}, "
+                f"Total Interpolated: {int(n1 - n2)} in {time() - t0:.5f}s\n'm")
+            
 
-
-
-    if timestamp_col in df.columns:
-        df = df.drop(columns=[timestamp_col])
-
-
+    # Convert dataset to numerical values (ignoring timestamp_col and symbol_col)
     if convert_numeric:
         if verbose:
-            print("[CLEAN] Converting to numeric types...")
-        start_time = time()
+            print("[---CLEAN---] Step 8: Converting Data to Numerical Values.")
+        
+        t0 = time()
 
-        protect = {symbol_col, timestamp_col}
         obj_cols = [c for c in df.select_dtypes(include=['object','string']).columns if c not in protect]
-
         if obj_cols:
             if using_gpu:
                 try:
@@ -236,21 +278,19 @@ def clean(
                                 pass
                 except Exception:
                     if verbose:
-                        print("[CLEAN] Skipping GPU numeric conversion (cuDF not available).")
+                        print("[---CLEAN---] Skipping GPU numeric conversion (cuDF not available).")
             else:
                 for c in obj_cols:
                     df[c] = pd.to_numeric(df[c], errors='coerce')
 
         if verbose:
-            print(f"[CLEAN] Converted numeric types in {time() - start_time:.3f}s")
+            print(f"[---CLEAN---] Converted dataset to numeric types in {time() - t0:.3f}s\n")
 
-    if timestamp is not None:
-        df[timestamp_col] = timestamp
-
+    
     if started_as_pandas and using_gpu:
         df = df.to_pandas()
 
     if verbose:
-        print(f"[CLEAN] Cleaning complete in {time() - start_total:.3f}s. Final shape: {df.shape}")
+        print(f"[---CLEAN---] Cleaning complete in {time() - start_total:.3f}s. Final shape: {df.shape}\n")
 
     return df
